@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
@@ -12,14 +12,28 @@ import { CodeViewer } from './CodeViewer';
 import { Alert, AlertDescription } from './ui/alert';
 import { Badge } from './ui/badge';
 
+// TypeScript interface for analysis result
+interface AnalysisResult {
+  id?: string;
+  summary: string;
+  errors: Array<{
+    line: number;
+    issue: string;
+    explanation: string;
+    severity: 'error' | 'warning' | 'info';
+  }>;
+  fixed_code: string;
+}
+
 export function CodeDebugger() {
   const [inputMethod, setInputMethod] = useState<'paste' | 'upload'>('paste');
   const [code, setCode] = useState('');
   const [language, setLanguage] = useState('python');
   const [fileName, setFileName] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analysisResult, setAnalysisResult] = useState<any>(null);
+  const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [viewMode, setViewMode] = useState<'split' | 'errors' | 'fixed'>('errors');
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -27,25 +41,77 @@ export function CodeDebugger() {
       setFileName(file.name);
       const reader = new FileReader();
       reader.onload = (event) => {
-        setCode(event.target?.result as string);
+        const result = event.target?.result;
+        // Validate that result is a string before setting
+        if (typeof result === 'string') {
+          setCode(result);
+        } else {
+          console.error('Failed to read file as text');
+          alert('Failed to read file. Please try again.');
+        }
+      };
+      reader.onerror = () => {
+        console.error('FileReader error');
+        alert('Error reading file. Please try again.');
       };
       reader.readAsText(file);
     }
   };
 
   const handleAnalyze = async () => {
-    if (!code.trim()) return;
+    // Validate input before proceeding
+    if (!code.trim()) {
+      alert('Please enter some code to analyze.');
+      return;
+    }
+    
+    if (!language) {
+      alert('Please select a programming language.');
+      return;
+    }
+    
+    // Cancel previous request if exists
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    
+    // Create new AbortController for this request
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     
     setIsAnalyzing(true);
+    
     try {
-      const result = await analyzeCode(code, language, fileName);
-      setAnalysisResult(result);
-      setViewMode('errors');
+      const result = await analyzeCode(code, language, fileName, controller.signal);
+      
+      // Only update state if request wasn't aborted
+      if (!controller.signal.aborted) {
+        // Validate result structure
+        if (!result) {
+          throw new Error('Received empty result from server');
+        }
+        
+        setAnalysisResult(result);
+        setViewMode('errors');
+      }
     } catch (error) {
+      // Handle abort errors gracefully (don't show error for cancelled requests)
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.log('Analysis request was cancelled');
+        return;
+      }
+      
       console.error('Analysis failed:', error);
-      alert('Failed to analyze code. Please try again.');
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : 'Failed to analyze code. Please try again.';
+      alert(errorMessage);
+      
+      // Reset state on error
+      setAnalysisResult(null);
     } finally {
       setIsAnalyzing(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -57,8 +123,16 @@ export function CodeDebugger() {
     const a = document.createElement('a');
     a.href = url;
     a.download = `fixed_${fileName || 'code'}.${getFileExtension(language)}`;
+    
+    // Append to DOM temporarily to ensure download works
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+    
+    // Revoke URL after a short delay to ensure download started
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 100);
   };
 
   const getFileExtension = (lang: string) => {
